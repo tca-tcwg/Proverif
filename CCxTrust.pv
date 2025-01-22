@@ -1,0 +1,336 @@
+(*  *)
+(* main *)
+(*  *)
+
+type nonce.
+
+
+(* Symmetric encryption *)
+type key.
+
+fun senc(bitstring, key): bitstring.
+reduc forall m:bitstring, k:key; sdec(senc(m,k),k) = m.
+
+
+(* Asymmetric encryption *)
+type skey. (* serect keys *)
+type pkey. (* public keys *)
+fun pk(skey): pkey.
+
+fun aenc(bitstring, pkey): bitstring.
+reduc forall m:bitstring, k:skey; adec(aenc(m,pk(k)),k) = m.
+
+
+(* Digital signatures *)
+type sskey. (* signatures serect keys *)
+type spkey.  (* signatures public keys *)
+fun spk(sskey): spkey.
+
+fun sign(bitstring, sskey): bitstring.
+reduc forall m:bitstring, k:sskey; check_sign(sign(m,k),spk(k)) = m.
+reduc forall m:bitstring, k:sskey; get_mess(sign(m,k)) = m. (* for adversary *)
+
+fun tc(spkey):bitstring [typeConverter].
+
+
+(* Hash functions *)
+
+fun h(spkey): bitstring.
+
+
+(* free *)
+
+
+(* channel *)
+free c_public: channel.
+free c_oca_tee: channel [private].      
+free c_oca_tpm: channel [private].
+free c_tee_tpm:channel [private].
+free c_tee_verifier: channel.
+free c_tpm_verifier: channel.
+
+
+(* event *)
+
+event request_cert(spkey).
+event issue_cert(spkey).
+event request_token(nonce).
+event issue_token(nonce).
+event request_attestation(nonce).
+event check_token(nonce).
+
+
+(* Queries *)
+query k:spkey; event(issue_cert(k)) ==> event(request_cert(k)).      (* property 1 *)
+query n:nonce; event(issue_token(n)) ==> event(request_token(n)).      (* property 2 *)
+query n:nonce; event(check_token(n)) ==> event(request_attestation(n)).    (* property 3 *)
+
+
+(*  *)
+(* initialization phase *)
+(* TEE initialization phase *)
+(*  *)
+
+(* constant *)
+const ark_priv,ask_priv:sskey[private]. (* AMD root key ARK, AMD singing key, RSA keys *) 
+
+
+(* function *)
+fun kdf_vcek((*ASP=*)bitstring, (*microcode=*)bitstring):sskey.(* SEV-SNP chip endorsement key VCEK, derived from the ASP and microcode version, ECDSA keys *) 
+  
+
+(* subprocess macro *)
+let TEEInit(vcek_cert_chain:bitstring) =
+
+  let(sign1:bitstring,sign2:bitstring,vcek_pub:spkey) = vcek_cert_chain in 
+  event request_cert(vcek_pub);
+
+  out(c_oca_tee,vcek_cert_chain);
+
+  in(c_oca_tee,oca_vcek_cert:bitstring);
+
+  out(c_tee_verifier, (oca_vcek_cert,vcek_pub)).
+
+
+(*  *)
+(* TPM initialization phase*)
+(*  *)
+
+(* type *)
+type seed.
+(* type nonce. *)
+type challenge.
+  
+(* function *)
+fun tmp_manufacture(seed):sskey.(* generate TPM chip endorsement key EK, RSA keys *) 
+fun kdf_aik(sskey):sskey.  (* generate TPM attestation identity key AIK *) 
+fun make_credential(nonce, bitstring, spkey):challenge.
+reduc forall n:nonce, k1:spkey, k2:sskey; active_credential(make_credential(n,h(k1),spk(k2)),h(k1),k2) = n. 
+  
+
+(* subprocess macro *)
+let TPMInit(aik_priv:sskey, ek_priv:sskey, ek_cert:bitstring) =
+  let aik_pub = spk(aik_priv) in
+  let ek_pub = spk(ek_priv) in
+  out(c_public, aik_pub);
+  event request_cert(aik_pub);
+  out(c_oca_tpm, (aik_pub,ek_pub,ek_cert));
+
+  in(c_oca_tpm, m:challenge);
+  let n = active_credential(m,h(aik_pub),ek_priv) in 
+  out(c_oca_tpm, n);
+
+  in(c_oca_tpm,oca_aik_cert:bitstring);
+
+
+  (* interoperate with verifier *) (* 有疑问，但与figure保持一致 *)
+  out(c_tpm_verifier,(oca_aik_cert,aik_pub)).
+
+
+(*  *)
+(* Owner CA initialization phase*)
+(*  *)
+
+(* subprocess macro *)
+let OCA(oca_priv:sskey,ark_pub:spkey,trust_tpm_ca_pub:spkey) =
+  (* interoperate with tee*)
+  in(c_oca_tee,vcek_cert_chain:bitstring);
+  let(sign1:bitstring,sign2:bitstring,vcek_pub:spkey) = vcek_cert_chain in 
+  let tc(ask_pub:spkey) = check_sign(sign1,ark_pub) in 
+  let (=tc(vcek_pub)) = check_sign(sign2,ask_pub) in 
+  let oca_vcek_cert:bitstring = sign(tc(vcek_pub),oca_priv) in 
+  out(c_oca_tee, oca_vcek_cert); 
+
+  event issue_cert(vcek_pub);
+
+
+  (* interoperate with tpm *)
+  in(c_oca_tpm,(aik_pub:spkey,ek_pub:spkey,ek_cert:bitstring));
+  let (=tc(ek_pub)) = check_sign(ek_cert,trust_tpm_ca_pub) in
+  new n:nonce;
+  let m:challenge = make_credential(n,h(aik_pub),ek_pub) in 
+  out(c_oca_tpm,m);  
+  in(c_oca_tpm,n1:nonce);
+  let (=n) = n1 in 
+  let oca_aik_cert:bitstring = sign(tc(aik_pub),oca_priv) in 
+  out(c_oca_tpm, oca_aik_cert);
+  event issue_cert(aik_pub).
+
+(*  *)
+(* Verifier initialization phase*)
+(*  *)
+
+(* subprocess macro *)
+let VerifierInit(oca_pub:spkey) =
+  
+  in(c_tpm_verifier,(oca_aik_cert:bitstring,aik_pub:spkey));
+  let (=tc(aik_pub)) = check_sign(oca_aik_cert,oca_pub) in 
+
+  in(c_tee_verifier,(oca_vcek_cert:bitstring,vcek_pub:spkey));
+  let (=tc(vcek_pub)) = check_sign(oca_vcek_cert,oca_pub) in
+  0.
+
+
+(*  *)
+(* attestation phase *)
+(* attestation-tpm with tee *)
+(* verifier attestation *)
+(*  *)
+
+(* subprocess macro *)
+let Verifier_tpm_tee(verifier_priv:sskey,aik_pub:spkey,vcek_pub:spkey,tee_tcb:bitstring) =
+
+  new n:nonce;
+  new PCR_sel:bitstring;
+  let attestation_request = (n,PCR_sel) in 
+  event request_attestation(n);
+  out(c_tpm_verifier,attestation_request);
+  in(c_tpm_verifier,total_report:bitstring);
+  let ((=PCR_sel),(=n),(tee_report:bitstring)) = check_sign(total_report,aik_pub) in 
+  let (=tee_tcb) = check_sign(tee_report,vcek_pub) in
+  new type_:bitstring;
+  new expire_time:bitstring;
+  new policy_:bitstring;
+
+  let token = sign((type_,total_report,expire_time,policy_),verifier_priv) in 
+  out(c_tpm_verifier,token);
+  event issue_token(n).
+
+
+(*  *)
+(* tpm attestation *)
+(*  *)
+
+(* subprocess macro *)
+let TPM_tpm_tee(aik_priv:sskey,verifier_pub:spkey) =
+
+  in(c_tpm_verifier,attestation_request:bitstring);
+  let (n:nonce,PCR_sel:bitstring) = attestation_request in 
+  let guest_report_request = n in 
+  out(c_tee_tpm,guest_report_request);
+  in(c_tee_tpm,tee_report:bitstring);
+  let total_report = sign((PCR_sel,n,tee_report),aik_priv) in 
+  event request_token(n);
+  out(c_tpm_verifier,total_report);
+  in(c_tpm_verifier,token:bitstring);
+  let (_:bitstring,(=total_report),_:bitstring,_:bitstring) = check_sign(token,verifier_pub) in 
+  event check_token(n).
+
+
+(*  *)
+(* tee Attestation *)
+(*  *)
+
+(* subprocess macro *)
+let TEE_tpm_tee(vcek_priv:sskey,tee_tcb:bitstring) =
+
+  in(c_tee_tpm,guest_report_request:nonce);
+  let tee_report = sign(tee_tcb,vcek_priv) in 
+  out(c_tee_tpm,tee_report).
+
+
+(*  *)
+(* attestation-tee with tpm *)
+(* verifier attestation *)
+(*  *)
+
+(* subprocess macro *)
+let Verifier_tee_tpm(verifier_priv:sskey,aik_pub:spkey,vcek_pub:spkey,tpm_PCRs:bitstring,tee_tcb:bitstring) =
+
+  new n:nonce;
+  new PCR_sel:bitstring;
+  let attestation_request = (n,PCR_sel) in 
+  event request_attestation(n);
+  out(c_tee_verifier,attestation_request);
+  in(c_tee_verifier,total_report:bitstring);
+  let ((=tee_tcb),(tpm_report:bitstring),(=n)) = check_sign(total_report,vcek_pub) in 
+  let (=tpm_PCRs) = check_sign(tpm_report,aik_pub) in
+  new type_:bitstring;
+  new expire_time:bitstring;
+  new policy_:bitstring;
+  let token = sign((type_,total_report,expire_time,policy_),verifier_priv) in 
+  out(c_tee_verifier,token);
+  event issue_token(n).
+
+
+(*  *)
+(* tee attestation *)
+(*  *)
+
+(* subprocess macro *)
+let TEE_tee_tpm(vcek_priv:sskey,tee_tcb:bitstring,verifier_pub:spkey) =
+
+  in(c_tee_verifier,attestation_request:bitstring);
+  let (n:nonce,PCR_sel:bitstring) = attestation_request in 
+  let tpm_quote_request = (n,PCR_sel) in 
+  event request_token(n);
+  out(c_tee_tpm,tpm_quote_request);
+  in(c_tee_tpm,tpm_report:bitstring);
+  let total_report = sign((tee_tcb,tpm_report,n),vcek_priv) in 
+
+  out(c_tee_verifier,total_report);
+  in(c_tee_verifier,token:bitstring);
+  let (_:bitstring,(=total_report),_:bitstring,_:bitstring) = check_sign(token,verifier_pub) in 
+  event check_token(n).
+
+(*  *)
+(* tpm attestation *)
+(*  *)
+
+(* subprocess macro *)
+let TPM_tee_tpm(aik_priv:sskey,tpm_PCRs:bitstring) =
+
+  in(c_tee_tpm,tpm_quote_request:bitstring);
+  let (n:nonce,PCR_sel:bitstring) = tpm_quote_request in 
+  let tpm_report = sign(tpm_PCRs,aik_priv) in 
+  out(c_tee_tpm,tpm_report).
+
+
+(*  *)
+(* main process *)
+(*  *)
+process
+
+  (* Initialization phase *)
+  (* TEE *)
+  new ASP:bitstring;
+  new microcode_version:bitstring;
+  let ark_pub = spk(ark_priv) in 
+  let ask_pub = spk(ask_priv) in 
+  let vcek_priv = kdf_vcek(ASP,microcode_version) in 
+  let vcek_pub = spk(vcek_priv) in 
+  let vcek_cert_chain = (sign(tc(ask_pub),ark_priv),sign(tc(vcek_pub),ask_priv),vcek_pub) in  (* simplification *)
+  out(c_public,(ark_pub, ask_pub, vcek_pub));
+
+  (* TPM *)
+  new epseed:seed;
+  new trust_tpm_ca_priv:sskey;
+  let trust_tpm_ca_pub = spk(trust_tpm_ca_priv) in 
+  let ek_priv = tmp_manufacture(epseed) in
+  let aik_priv = kdf_aik(ek_priv) in
+  let aik_pub = spk(aik_priv) in 
+  let ek_pub = spk(ek_priv) in
+  let ek_cert = sign(tc(ek_pub),trust_tpm_ca_priv) in 
+
+  out(c_public, (trust_tpm_ca_pub, ek_pub, aik_pub));
+
+  (* OCA *)
+  new oca_priv:sskey;
+  let oca_pub = spk(oca_priv) in 
+  out(c_public, oca_pub);
+
+
+
+  new verifier_priv:sskey;
+  new OVMF:bitstring;
+  new GuestKernel:bitstring;
+  new GuestInitrd:bitstring;
+  new KernelCmdline:bitstring;
+  new tpm_PCRs:bitstring;
+  let tee_tcb = (OVMF,GuestKernel,GuestInitrd,KernelCmdline) in
+  let verifier_pub = spk(verifier_priv) in
+
+
+
+
+  ((!OCA(oca_priv,ark_pub,trust_tpm_ca_pub)) | (!TEEInit(vcek_cert_chain)) | (!TPMInit(aik_priv,ek_priv,ek_cert) )| (!VerifierInit(oca_pub)) | (!Verifier_tpm_tee(verifier_priv,aik_pub,vcek_pub,tee_tcb)) | (!TPM_tpm_tee(aik_priv,verifier_pub)) | (!TEE_tpm_tee(vcek_priv,tee_tcb)) | (!Verifier_tee_tpm(verifier_priv,aik_pub,vcek_pub,tpm_PCRs,tee_tcb)) | (!TEE_tee_tpm(vcek_priv,tee_tcb,verifier_pub)) | (!TPM_tee_tpm(aik_priv,tpm_PCRs)))
